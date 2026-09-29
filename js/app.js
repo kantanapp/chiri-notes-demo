@@ -1,0 +1,525 @@
+// Geography Notes 穴埋めアプリ
+// データは data/units.js（window.GEO_DATA）から読み込む。
+// 入力内容と「答え合わせ」の記録はブラウザ（localStorage）に保存される。
+(function () {
+  "use strict";
+
+  const DATA = window.GEO_DATA;
+  const STORE_KEY = "chiri-notes-demo-v1";
+  const HISTORY_MAX = 50;
+  const $ = (id) => document.getElementById(id);
+
+  // ---------- 保存 ----------
+  function load() {
+    try { return JSON.parse(localStorage.getItem(STORE_KEY)) || {}; }
+    catch (e) { return {}; }
+  }
+  function save() {
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) { /* 保存できなくても動かす */ }
+  }
+  const state = Object.assign({ unit: DATA.units[0].id, mode: "read", answers: {}, history: [] }, load());
+
+  // ---------- 問題の分解（描画せずに採点するため） ----------
+  // unit.id -> [{ key, no, accepted:[...] }]
+  const BLANKS = {};
+  DATA.units.forEach((u) => {
+    let n = 0;
+    BLANKS[u.id] = [];
+    u.blocks.forEach((b) => {
+      b.text.replace(/\{([^}]+)\}/g, (_, raw) => {
+        n += 1;
+        BLANKS[u.id].push({ key: `${u.id}#${n}`, no: n, accepted: raw.split("|").map((s) => s.trim()) });
+      });
+    });
+  });
+
+  // ---------- 判定 ----------
+  // 大文字小文字・前後の空白・ハイフン/スペースの違い・末尾の記号は無視する
+  function normalize(s) {
+    return String(s).normalize("NFKC").toLowerCase().trim()
+      .replace(/[\u2010-\u2015-]/g, " ")
+      .replace(/[.,!?;:'"。、・]+$/g, "")
+      .replace(/\s+/g, " ");
+  }
+  function isCorrect(value, accepted) {
+    const v = normalize(value || "");
+    return v !== "" && accepted.some((a) => normalize(a) === v);
+  }
+
+  function unitStats(unitId) {
+    const list = BLANKS[unitId];
+    let correct = 0, wrong = 0, empty = 0;
+    const misses = [];
+    list.forEach((b) => {
+      const v = state.answers[b.key] || "";
+      if (!v.trim()) { empty++; misses.push({ ...b, value: "" }); }
+      else if (isCorrect(v, b.accepted)) correct++;
+      else { wrong++; misses.push({ ...b, value: v }); }
+    });
+    return { total: list.length, correct, wrong, empty, misses };
+  }
+
+  // ---------- 描画 ----------
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  }
+  const pct = (a, b) => (b ? Math.round((a / b) * 100) : 0);
+
+  function renderTabs() {
+    $("tabs").innerHTML = DATA.units.map((u) => {
+      const s = unitStats(u.id);
+      const done = s.correct === s.total ? " done" : "";
+      return `<button type="button" class="tab${done}" role="tab" data-unit="${u.id}" aria-selected="${u.id === state.unit}">` +
+        `${u.id}<small>${s.correct}/${s.total}</small></button>`;
+    }).join("");
+  }
+
+  // ---------- 読みものモード ----------
+  // 空欄に答えを入れた状態で、Unit 1.1〜1.3 を通しで読めるようにする。
+  // 答えは data/units.js の先頭の答え（正式な答え）をそのまま置く。
+  function unitProse(unit) {
+    const list = BLANKS[unit.id];
+    let i = 0;
+    return unit.blocks.map((b) => {
+      const body = escapeHtml(b.text).replace(/\{([^}]+)\}/g, () =>
+        `<b class="filled">${escapeHtml(list[i++].accepted[0])}</b>`);
+      if (b.type === "heading") return `<h4 class="sec">${body}</h4>`;
+      if (b.type === "bullet") return `<p class="bullet">${body}</p>`;
+      return `<p class="p">${body}</p>`;
+    }).join("");
+  }
+
+  function renderRead() {
+    $("sheet").className = "sheet read";
+    $("sheet").innerHTML =
+      `<h2 class="unit-title">地理ノート（デモ）</h2>` +
+      `<p class="unit-sub">まずは通して読もう。<b class="filled">太字</b>のところが、あとで穴埋めになる言葉です。</p>` +
+      DATA.units.map((u) =>
+        `<section class="read-unit" id="u-${u.id.replace(".", "-")}">` +
+        `<h3 class="read-h">単元 ${u.id}<span> ${escapeHtml(u.title)}</span></h3>` +
+        unitProse(u) + `</section>`).join("") +
+      `<p class="read-end">ここまでで全部です。<br>自分で穴埋めに挑戦してみよう。</p>` +
+      `<p class="read-cta"><button type="button" class="btn primary" id="btn-start-2">✏️ テストする</button></p>`;
+    updateScore();
+  }
+
+  function renderUnit() {
+    const unit = DATA.units.find((u) => u.id === state.unit) || DATA.units[0];
+    const list = BLANKS[unit.id];
+    let i = 0;
+    const html = unit.blocks.map((b) => {
+      const body = escapeHtml(b.text).replace(/\{([^}]+)\}/g, () => {
+        const blank = list[i++];
+        const val = state.answers[blank.key] || "";
+        // 幅は答えの長さに合わせない（ヒントにならないよう入力に合わせて伸びる）
+        const width = fitWidth(val);
+        return `<span class="blank" id="b-${blank.no}" data-key="${blank.key}" data-accept="${escapeHtml(JSON.stringify(blank.accepted))}">` +
+          `<input type="text" value="${escapeHtml(val)}" style="width:${width}ch" ` +
+          `aria-label="空欄 ${blank.no}" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="next">` +
+          `<span class="answer">${escapeHtml(blank.accepted[0])}</span></span>`;
+      });
+      if (b.type === "heading") return `<h3 class="sec">${body}</h3>`;
+      if (b.type === "bullet") return `<p class="bullet">${body}</p>`;
+      return `<p class="p">${body}</p>`;
+    }).join("");
+
+    $("sheet").className = "sheet";
+    $("btn-reveal").textContent = "答えを見る";
+    $("sheet").innerHTML =
+      `<h2 class="unit-title">単元 ${unit.id}　${escapeHtml(unit.title)}</h2>` +
+      `<p class="unit-sub">空欄をタップして答えを入力。Enterで次の空欄へ進みます。</p>` + html;
+
+    blanks().forEach((el) => { if (input(el).value) judge(el); });
+    updateScore();
+  }
+
+  function fitWidth(v) { let w = 0; for (const c of String(v)) w += /[\u3000-\u9fff\uff00-\uffef]/.test(c) ? 2 : 1; return Math.min(28, Math.max(8, w + 2)); }
+
+  const blanks = () => Array.from(document.querySelectorAll(".blank"));
+  const input = (el) => el.querySelector("input");
+
+  function judge(el) {
+    const val = input(el).value;
+    el.classList.remove("correct", "wrong");
+    if (!val.trim()) return;
+    el.classList.add(isCorrect(val, JSON.parse(el.dataset.accept)) ? "correct" : "wrong");
+  }
+
+  function updateScore() {
+    const s = unitStats(state.unit);
+    $("score").innerHTML = `<span class="score-num"><strong>${s.correct}</strong> / ${s.total}</span><span class="score-go">★ 記録</span>`;
+    $("progress-bar").style.width = `${pct(s.correct, s.total)}%`;
+    renderTabs();
+    renderKiroku();
+  }
+
+  // ---------- 全体の集計（きろくページ用） ----------
+  function overall() {
+    const byUnit = {};
+    let correct = 0, total = 0;
+    DATA.units.forEach((u) => {
+      const s = unitStats(u.id);
+      byUnit[u.id] = s; correct += s.correct; total += s.total;
+    });
+    return { byUnit, correct, total, attempts: state.history.length, streak: streak(), days: dayList().length };
+  }
+
+  // 答え合わせをした日（重複なし・古い順）
+  function dayList() {
+    const set = new Set(state.history.map((h) => {
+      const d = new Date(h.at);
+      return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+    }));
+    return Array.from(set).sort((a, b) => new Date(a) - new Date(b));
+  }
+  // いちばん長く続いた日数
+  function streak() {
+    const days = dayList().map((d) => new Date(d).getTime());
+    let best = 0, run = 0;
+    days.forEach((t, i) => {
+      run = (i > 0 && Math.round((t - days[i - 1]) / 86400000) === 1) ? run + 1 : 1;
+      if (run > best) best = run;
+    });
+    return best;
+  }
+
+  // ---------- ごほうびバッジ ----------
+  // got: もらえたか / now・goal: あと少しを見せるための数（いらないバッジは省略）
+  const BADGES = [
+    { icon: "🌱", name: "はじめの一歩", need: "答え合わせを1回する",
+      got: (o) => o.attempts >= 1, now: (o) => o.attempts, goal: 1 },
+    { icon: "🔥", name: "答え合わせ10回", need: "答え合わせを10回する",
+      got: (o) => o.attempts >= 10, now: (o) => o.attempts, goal: 10 },
+    { icon: "📅", name: "3日連続", need: "3日続けて答え合わせする",
+      got: (o) => o.streak >= 3, now: (o) => o.streak, goal: 3 },
+    { icon: "⛰️", name: "折り返し", need: "全体の半分を正解する",
+      got: (o) => o.correct * 2 >= o.total, now: (o) => o.correct, goal: (o) => Math.ceil(o.total / 2) }
+  ].concat(DATA.units.map((u) => ({
+    icon: "🗺️", name: `単元 ${u.id} 満点`, need: `単元 ${u.id} を全問正解する`,
+    got: (o) => o.byUnit[u.id].correct === o.byUnit[u.id].total,
+    now: (o) => o.byUnit[u.id].correct, goal: (o) => o.byUnit[u.id].total
+  }))).concat([
+    { icon: "🏆", name: "全部クリア", need: "全単元を全問正解する",
+      got: (o) => o.total > 0 && o.correct === o.total, now: (o) => o.correct, goal: (o) => o.total }
+  ]);
+
+  // ---------- 結果パネル ----------
+  function formatDate(ts) {
+    const d = new Date(ts);
+    const p = (n) => String(n).padStart(2, "0");
+    return `${d.getMonth() + 1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+
+  // 点数に合わせたほめ言葉と星（子どもが次もやりたくなるように）
+  function praise(p) {
+    if (p >= 100) return { face: "🏆", word: "満点！", sub: "全部正解です" };
+    if (p >= 80) return { face: "🎉", word: "すごい！", sub: "あと少しで満点" };
+    if (p >= 50) return { face: "👍", word: "いいね！", sub: "半分を超えました" };
+    if (p >= 20) return { face: "💪", word: "その調子！", sub: "埋めた分だけ前に進んでいます" };
+    if (p > 0) return { face: "🌱", word: "スタートした！", sub: "ここから積み上げよう" };
+    return { face: "✏️", word: "はじめよう", sub: "空欄ひとつが一歩です" };
+  }
+  function stars(p) {
+    const n = p >= 100 ? 3 : p >= 80 ? 2 : p >= 50 ? 1 : 0;
+    return `<span class="stars" aria-label="星${n}つ（3つ中）">${"★".repeat(n)}${"☆".repeat(3 - n)}</span>`;
+  }
+
+  function openResult() {
+    const unit = DATA.units.find((u) => u.id === state.unit);
+    const s = unitStats(unit.id);
+    const p = pct(s.correct, s.total);
+    const pr = praise(p);
+
+    const missList = s.misses.length
+      ? `<ul class="misses">${s.misses.map((m) =>
+          `<li><button type="button" data-jump="${m.no}"><span class="no">(${m.no})</span>` +
+          `<span class="yours${m.value ? "" : " empty"}">${m.value ? escapeHtml(m.value) : "未記入"}</span>` +
+          `<span class="right">${escapeHtml(m.accepted[0])}</span></button></li>`).join("")}</ul>`
+      : `<p class="allclear">🏆 全部正解！</p>`;
+
+    $("result-title").textContent = `単元 ${unit.id} の結果`;
+    $("result-body").innerHTML =
+      `<div class="cheer"><div class="cheer-face">${pr.face}</div>` +
+      `<div><p class="cheer-word">${pr.word}</p><p class="cheer-sub">${pr.sub}</p></div></div>` +
+      `<p class="big">${s.correct}<span> / ${s.total}（${p}%）</span> ${stars(p)}</p>` +
+      `<p class="counts"><span>正解 <b class="ok">${s.correct}</b></span>` +
+      `<span>まちがい <b class="ng">${s.wrong}</b></span><span>空欄 <b>${s.empty}</b></span></p>` +
+      (s.misses.length ? `<h3>見直そう（タップでその空欄へ）</h3>` : "") + missList +
+      `<p class="result-foot">これまでの記録は、ページ下の <b>★ 記録</b> にあります</p>`;
+    $("result").showModal();
+  }
+
+  function recordAttempt() {
+    const s = unitStats(state.unit);
+    state.history.push({ at: Date.now(), unit: state.unit, correct: s.correct, wrong: s.wrong, empty: s.empty, total: s.total });
+    if (state.history.length > HISTORY_MAX) state.history = state.history.slice(-HISTORY_MAX);
+    save();
+  }
+
+  // ---------- きろくページ ----------
+  // ドーナツ型の進みぐあい（中に % を出す）
+  function ring(percent, size, thick) {
+    const r = (size - thick) / 2, c = 2 * Math.PI * r;
+    return `<svg class="ring" viewBox="0 0 ${size} ${size}" width="${size}" height="${size}" role="img" aria-label="${percent}%">` +
+      `<circle class="ring-track" cx="${size / 2}" cy="${size / 2}" r="${r}" stroke-width="${thick}" fill="none"></circle>` +
+      `<circle class="ring-fill" cx="${size / 2}" cy="${size / 2}" r="${r}" stroke-width="${thick}" fill="none"` +
+      ` stroke-dasharray="${c}" stroke-dashoffset="${c * (1 - percent / 100)}"` +
+      ` transform="rotate(-90 ${size / 2} ${size / 2})"></circle>` +
+      `<text class="ring-text" x="50%" y="50%" text-anchor="middle" dominant-baseline="central">${percent}%</text></svg>`;
+  }
+
+  function heroMsg(o) {
+    const p = pct(o.correct, o.total);
+    if (o.total === 0) return "さあ、はじめよう！";
+    if (p >= 100) return "全部クリア！本当によくがんばりました。";
+    if (p >= 80) return `あと${o.total - o.correct}問で全部クリア！`;
+    if (p >= 50) return "半分を超えました。この調子！";
+    if (p >= 20) return "いいペース。やるほど楽になります。";
+    if (p > 0) return "スタートした！ここから積み上げよう。";
+    return "さあ、はじめよう！空欄ひとつが一歩です。";
+  }
+
+  // がんばりグラフ（直近の答え合わせの せいかい率）
+  // 1本だけの系列なので色は1色。数字は「さいしん」と「さいこう」だけに付け、
+  // 残りはタップ/ホバーの吹き出しと、下の「きろく」の表で読めるようにする。
+  const CHART_MAX = 12;
+  function chart() {
+    const rows = state.history.slice(-CHART_MAX).map((h) => ({ ...h, p: pct(h.correct, h.total) }));
+    if (!rows.length) {
+      return `<p class="k-empty">まだグラフはありません。<br><b>答え合わせ</b>をすると、ここに増えていきます。</p>`;
+    }
+    const W = 320, H = 150, L = 30, R = 8, T = 20, B = 24;
+    const pw = W - L - R, ph = H - T - B;
+    const band = pw / rows.length;
+    const bw = Math.min(16, band - 6); // 実寸で 24px を超えないように（SVG は拡大されるため小さめに取る）
+    const y = (v) => T + ph * (1 - v / 100);
+    const best = Math.max(...rows.map((r) => r.p));
+    const bestIdx = rows.findIndex((r) => r.p === best);
+
+    const grid = [0, 50, 100].map((v) =>
+      `<line class="c-grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"></line>` +
+      `<text class="c-axis" x="${L - 6}" y="${y(v)}" text-anchor="end" dominant-baseline="central">${v}</text>`).join("");
+
+    const bars = rows.map((r, i) => {
+      const cx = L + band * i + band / 2;
+      const x = cx - bw / 2;
+      const top = y(r.p), h = Math.max(r.p === 0 ? 0 : 2, y(0) - top);
+      const rad = Math.min(4, h, bw / 2);
+      // 上だけ角を丸め、下（0のライン）は四角のまま
+      const d = h === 0 ? "" :
+        `M${x} ${y(0)} L${x} ${top + rad} Q${x} ${top} ${x + rad} ${top} L${x + bw - rad} ${top} Q${x + bw} ${top} ${x + bw} ${top + rad} L${x + bw} ${y(0)} Z`;
+      const label = (i === rows.length - 1 || i === bestIdx)
+        ? `<text class="c-val" x="${cx}" y="${top - 6}" text-anchor="middle">${r.p}%</text>` : "";
+      return (d ? `<path class="c-bar" d="${d}"></path>` : "") + label +
+        `<rect class="c-hit" x="${L + band * i}" y="${T}" width="${band}" height="${ph}" tabindex="0" role="button"` +
+        ` data-tip="${escapeHtml(`${formatDate(r.at)} · 単元 ${r.unit} · ${r.correct}/${r.total} (${r.p}%)`)}"></rect>`;
+    }).join("");
+
+    const ends = `<text class="c-axis" x="${L}" y="${H - 6}">${formatDate(rows[0].at).split(" ")[0]}</text>` +
+      (rows.length > 1 ? `<text class="c-axis" x="${W - R}" y="${H - 6}" text-anchor="end">最新</text>` : "");
+
+    return `<div class="chart-wrap"><svg class="chart" viewBox="0 0 ${W} ${H}" role="img"` +
+      ` aria-label="答え合わせごとの正答率。同じ数字は下の表にもあります。">` +
+      grid + bars + ends + `</svg><div class="chart-tip" id="chart-tip" hidden></div></div>`;
+  }
+
+  function renderKiroku() {
+    const o = overall();
+    const p = pct(o.correct, o.total);
+
+    const unitCards = DATA.units.map((u) => {
+      const s = o.byUnit[u.id];
+      const up = pct(s.correct, s.total);
+      const left = s.total - s.correct;
+      return `<div class="k-unit${up === 100 ? " done" : ""}">${ring(up, 64, 8)}` +
+        `<div class="k-unit-body"><p class="k-unit-name">単元 ${u.id}${up === 100 ? " 🏆" : ""}</p>` +
+        `<p class="k-unit-num">${s.correct} / ${s.total} 問</p>` +
+        `<p class="k-unit-left">${left ? `あと${left}問` : "クリア！"}</p></div>` +
+        `<button type="button" class="btn small" data-go="${u.id}">やる</button></div>`;
+    }).join("");
+
+    const gotCount = BADGES.filter((b) => b.got(o)).length;
+    const badges = BADGES.map((b) => {
+      const got = b.got(o);
+      const goal = typeof b.goal === "function" ? b.goal(o) : b.goal;
+      const now = Math.min(b.now(o), goal);
+      return `<div class="k-badge${got ? " got" : ""}"><span class="k-badge-icon">${b.icon}</span>` +
+        `<span class="k-badge-name">${escapeHtml(b.name)}</span>` +
+        (got ? `<span class="k-badge-got">ゲット！</span>`
+             : `<span class="k-badge-need">${escapeHtml(b.need)}</span>` +
+               `<span class="k-badge-bar"><i style="width:${pct(now, goal)}%"></i></span>` +
+               `<span class="k-badge-now">${now} / ${goal}</span>`) + `</div>`;
+    }).join("");
+
+    const hist = state.history.slice().reverse().slice(0, 20);
+    const histHtml = hist.length
+      ? `<div class="table-wrap"><table class="history"><caption class="sr-only">答え合わせの記録</caption>` +
+        `<tr><th>日時</th><th>単元</th><th>正解</th><th>正答率</th></tr>` +
+        hist.map((h) => `<tr><td>${formatDate(h.at)}</td><td>${h.unit}</td><td>${h.correct}/${h.total}</td>` +
+          `<td><span class="bar"><i style="width:${pct(h.correct, h.total)}%"></i></span>${pct(h.correct, h.total)}%</td></tr>`).join("") +
+        `</table></div>`
+      : `<p class="k-empty">まだ記録はありません。<b>答え合わせ</b>をすると、1回ずつここに残ります。</p>`;
+
+    $("kiroku").innerHTML =
+      `<h2 class="k-title" id="k-title">★ 記録</h2>` +
+      `<section class="k-hero">${ring(p, 104, 12)}` +
+      `<div><p class="k-hero-num">${o.correct}<span> / ${o.total} 問 正解</span></p>` +
+      `<p class="k-hero-msg">${escapeHtml(heroMsg(o))}</p>` +
+      `<p class="k-hero-sub">答え合わせ ${o.attempts}回 · ` +
+      `勉強した日 ${o.days}日` +
+      `${o.streak >= 2 ? ` · 最長 ${o.streak}日連続` : ""}</p></div></section>` +
+      `<h3 class="k-h">単元ごと</h3><div class="k-units">${unitCards}</div>` +
+      `<h3 class="k-h">ごほうび <span class="k-count">${gotCount} / ${BADGES.length}</span></h3>` +
+      `<div class="k-badges">${badges}</div>` +
+      `<h3 class="k-h">正答率のグラフ</h3>` +
+      `<p class="k-sub">答え合わせごとの正答率（右がいちばん新しい）</p>${chart()}` +
+      `<h3 class="k-h">これまでの記録</h3>${histHtml}` +
+      `<p class="k-top"><a href="#main">&uarr; 問題にもどる</a></p>`;
+  }
+
+  // きろくは問題の下にいつも出している（別画面にしない）ので、
+  // 点数が動いたら その場で描きなおす。
+  // 上の固定バーの高さぶんだけ手前で止める（スマホは2段になって高くなるので実測する）
+  function jumpTo(id) {
+    const el = $(id);
+    if (!el) return;
+    const bar = document.querySelector(".topbar");
+    const top = el.getBoundingClientRect().top + window.scrollY - (bar ? bar.offsetHeight : 0) - 8;
+    window.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
+  }
+
+  // ---------- 読む / れんしゅう の切りかえ ----------
+  function render() { if (state.mode === "read") renderRead(); else renderUnit(); }
+
+  function setMode(mode, opts) {
+    state.mode = mode; save();
+    const read = mode === "read";
+    Array.from($("modebar").children).forEach((b) =>
+      b.setAttribute("aria-selected", String(b.dataset.mode === mode)));
+    $("actions-read").hidden = !read;
+    $("actions-quiz").hidden = read;
+    render();
+    if (!opts || !opts.keepScroll) window.scrollTo(0, 0);
+  }
+
+  // ---------- 操作 ----------
+  $("modebar").addEventListener("click", (e) => {
+    const b = e.target.closest(".mode");
+    if (b && b.dataset.mode !== state.mode) setMode(b.dataset.mode);
+  });
+
+  $("btn-start").addEventListener("click", () => setMode("quiz"));
+  $("btn-progress-read").addEventListener("click", () => jumpTo("kiroku"));
+  $("sheet").addEventListener("click", (e) => {
+    if (e.target.closest("#btn-start-2")) setMode("quiz");
+  });
+  $("tabs").addEventListener("click", (e) => {
+    const t = e.target.closest(".tab");
+    if (!t) return;
+    // 読みものモードでは その Unit の見出しへスクロールするだけ。
+    // ただし「今どこを読んでいるか」は覚えておいて、れんしゅうに移った時そこから始める。
+    if (state.mode === "read") {
+      state.unit = t.dataset.unit; save(); renderTabs();
+      jumpTo("u-" + t.dataset.unit.replace(".", "-"));
+      return;
+    }
+    state.unit = t.dataset.unit;
+    save(); renderUnit();
+    window.scrollTo(0, 0);
+  });
+
+  $("sheet").addEventListener("input", (e) => {
+    const el = e.target.closest(".blank");
+    if (!el) return;
+    state.answers[el.dataset.key] = e.target.value;
+    e.target.style.width = fitWidth(e.target.value) + "ch";
+    el.classList.remove("correct", "wrong");
+    save();
+  });
+
+  $("sheet").addEventListener("focusout", (e) => {
+    const el = e.target.closest(".blank");
+    if (el) { judge(el); updateScore(); }
+  });
+
+  $("sheet").addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" || e.isComposing) return;
+    const el = e.target.closest(".blank");
+    if (!el) return;
+    e.preventDefault();
+    const all = blanks();
+    const next = all[all.indexOf(el) + 1];
+    if (next) input(next).focus(); else input(el).blur();
+  });
+
+  $("btn-check").addEventListener("click", () => {
+    blanks().forEach(judge);
+    updateScore();
+    recordAttempt();
+    renderKiroku();
+    openResult();
+  });
+
+  // 上の点数（★ Progress）→ 下のきろくへスクロール。
+  // href="#kiroku" だけだと「同じ場所への2回目のクリック」で何も起きないので、自分でスクロールする。
+  $("score").addEventListener("click", (e) => { e.preventDefault(); jumpTo("kiroku"); });
+
+  // 下のボタンバーの「★ Progress」→ 下のきろくへスクロール
+  $("btn-progress").addEventListener("click", () => jumpTo("kiroku"));
+
+  // 結果パネルの「★ Progress」→ 下のきろくへスクロール
+  $("btn-to-kiroku").addEventListener("click", () => { $("result").close(); jumpTo("kiroku"); });
+
+  // きろくの「Go」ボタン → その Unit の問題へ（上にもどる）
+  $("kiroku").addEventListener("click", (e) => {
+    if (e.target.closest(".k-top a")) { e.preventDefault(); window.scrollTo({ top: 0, behavior: "smooth" }); return; }
+    const go = e.target.closest("[data-go]");
+    if (!go) return;
+    state.unit = go.dataset.go;
+    save();
+    if (state.mode === "read") { setMode("quiz"); return; }
+    renderUnit(); window.scrollTo(0, 0);
+  });
+
+  // がんばりグラフの吹き出し（タップ・マウス・キーボードのどれでも出す）
+  function showTip(hit) {
+    const tip = $("chart-tip"), wrap = hit.closest(".chart-wrap");
+    if (!tip || !wrap) return;
+    tip.textContent = hit.dataset.tip;
+    tip.hidden = false;
+    const r = hit.getBoundingClientRect(), w = wrap.getBoundingClientRect();
+    const x = r.left - w.left + r.width / 2;
+    tip.style.left = Math.max(4, Math.min(w.width - tip.offsetWidth - 4, x - tip.offsetWidth / 2)) + "px";
+  }
+  function hideTip() { const tip = $("chart-tip"); if (tip) tip.hidden = true; }
+  $("kiroku").addEventListener("pointerover", (e) => { const h = e.target.closest(".c-hit"); if (h) showTip(h); });
+  $("kiroku").addEventListener("pointerdown", (e) => { const h = e.target.closest(".c-hit"); if (h) showTip(h); });
+  $("kiroku").addEventListener("focusin", (e) => { const h = e.target.closest(".c-hit"); if (h) showTip(h); });
+  $("kiroku").addEventListener("pointerleave", hideTip);
+  $("kiroku").addEventListener("focusout", hideTip);
+  $("btn-close").addEventListener("click", () => $("result").close());
+  $("result").addEventListener("click", (e) => {
+    if (e.target === $("result")) { $("result").close(); return; }
+    const j = e.target.closest("[data-jump]");
+    if (!j) return;
+    $("result").close();
+    const el = $("b-" + j.dataset.jump);
+    el.scrollIntoView({ block: "center" });
+    input(el).focus();
+  });
+
+  $("btn-reveal").addEventListener("click", () => {
+    blanks().forEach(judge);
+    updateScore();
+    const on = $("sheet").classList.toggle("reveal");
+    $("btn-reveal").textContent = on ? "答えをかくす" : "答えを見る";
+  });
+
+  $("btn-reset").addEventListener("click", () => {
+    if (!confirm(`単元 ${state.unit} の入力を全部消しますか？\n答え合わせの記録は残ります。`)) return;
+    Object.keys(state.answers).forEach((k) => { if (k.startsWith(state.unit + "#")) delete state.answers[k]; });
+    save(); renderUnit();
+  });
+
+  setMode(state.mode === "quiz" ? "quiz" : "read", { keepScroll: true });
+})();
